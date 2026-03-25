@@ -168,6 +168,8 @@ def verify_code(code: str, code_verifier: str, client_id: str, redirect_uri: str
 
 # ── JWT access token ─────────────────────────────────────────────────────────
 
+_refresh_tokens: dict[str, dict] = {}
+
 def create_access_token(email: str) -> str:
     """Create JWT access token (HS256, 1 hour)."""
     now = int(time.time())
@@ -178,10 +180,17 @@ def create_access_token(email: str) -> str:
         "email": email,
         "scope": "mcp",
         "iat": now,
-        "exp": now + 3600,
+        "exp": now + 604800,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
+def create_refresh_token(email: str) -> str:
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    _refresh_tokens[token] = {
+        "email": email,
+        "created_at": int(time.time()),
+    }
+    return token    
 
 def verify_access_token(token: str) -> dict:
     """Verify JWT access token. Returns payload if valid."""

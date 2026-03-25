@@ -275,27 +275,46 @@ async def token_endpoint(
     code_verifier: str = Form(None),
     client_id: str = Form(None),
     redirect_uri: str = Form(None),
+    refresh_token: str = Form(None),
 ):
-    """Exchange authorization code for access token (PKCE)."""
-    if grant_type != "authorization_code":
+    if grant_type == "authorization_code":
+        if not all([code, code_verifier, client_id, redirect_uri]):
+            raise HTTPException(status_code=400, detail="Missing required parameters")
+
+        email = verify_code(code, code_verifier, client_id, redirect_uri) \
+            if 'redirect_uri' in verify_code.__code__.co_varnames \
+            else verify_code(code, code_verifier, client_id)
+
+        access_token = create_access_token(email)
+
+        from auth_oauth import create_refresh_token
+        new_refresh_token = create_refresh_token(email)
+
+        return {
+            "access_token": access_token,
+            "refresh_token": new_refresh_token,
+            "token_type": "Bearer",
+            "expires_in": 86400,
+        }
+
+    elif grant_type == "refresh_token":
+        from auth_oauth import _refresh_tokens
+
+        data = _refresh_tokens.get(refresh_token)
+        if not data:
+            raise HTTPException(status_code=401, detail="Invalid refresh_token")
+
+        email = data["email"]
+        access_token = create_access_token(email)
+
+        return {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 86400,
+        }
+
+    else:
         raise HTTPException(status_code=400, detail="Unsupported grant_type")
-
-    if not all([code, code_verifier, client_id, redirect_uri]):
-        raise HTTPException(status_code=400, detail="Missing required parameters")
-
-    # Verify code + PKCE → get email
-    # Verify code + PKCE → get email
-    # Also validate redirect_uri binding (critical for OAuth security)
-    email = verify_code(code, code_verifier, client_id, redirect_uri) if 'redirect_uri' in verify_code.__code__.co_varnames else verify_code(code, code_verifier, client_id)
-
-    # Create JWT access token
-    access_token = create_access_token(email)
-
-    return {
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "expires_in": 3600,
-    }
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -355,8 +374,8 @@ async def sse_endpoint(request: Request):
                 except asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
         finally:
-            sessions.pop(session_id, None)
-            log.info(f"SSE session closed: {session_id}")
+            # не удаляем сессию — иначе ChatGPT теряет её при reconnect
+            log.info(f"SSE session closed (kept): {session_id}")
 
     log.info(f"New SSE session: {session_id}")
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -376,7 +395,7 @@ async def messages_endpoint(request: Request, _=Depends(require_auth)):
         if response is not None:
             await queue.put(response)
 
-    asyncio.create_task(process())
+    await process()
     return Response(status_code=202)
 
 
