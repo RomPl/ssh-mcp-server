@@ -1,0 +1,29 @@
+[Unit]
+Description=SSH MCP Server (HTTP+SSE)
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+Group=yourgroup
+WorkingDirectory=/home/youruser/ssh-mcp-server
+ExecStart=/home/youruser/ssh-mcp-server/.venv/bin/python server_http.py
+EnvironmentFile=/home/youruser/ssh-mcp-server/.env
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ssh-mcp
+
+[Install]
+WantedBy=multi-user.target
