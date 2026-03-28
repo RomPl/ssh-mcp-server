@@ -6,6 +6,7 @@ Supports key-based auth (RSA, Ed25519, ECDSA) with optional passphrase.
 from __future__ import annotations
 
 import os
+import socket
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +45,8 @@ class CommandResult:
 
 _pool: dict[str, paramiko.SSHClient] = {}
 _lock = threading.Lock()
+
+KEEPALIVE_SECONDS = 30
 
 DEFAULT_KEY_PATHS = [
     "~/.ssh/id_ed25519",
@@ -100,29 +103,59 @@ def _connect(cfg: SSHConfig) -> paramiko.SSHClient:
                     continue
 
     client.connect(**connect_kwargs)
+    transport = client.get_transport()
+    if transport:
+        transport.set_keepalive(KEEPALIVE_SECONDS)
     return client
 
 
-def get_client(cfg: SSHConfig) -> paramiko.SSHClient:
-    with _lock:
-        existing = _pool.get(cfg.key())
-        if existing:
-            transport = existing.get_transport()
-            if transport and transport.is_active():
-                return existing
-            # Stale connection — remove and reconnect
-            _pool.pop(cfg.key(), None)
+def _is_alive(client: paramiko.SSHClient) -> bool:
+    try:
+        transport = client.get_transport()
+        if not transport or not transport.is_active():
+            return False
+        chan = transport.open_session(timeout=2.0)
+        try:
+            return chan is not None
+        finally:
+            if chan is not None:
+                chan.close()
+    except Exception:
+        return False
 
-        client = _connect(cfg)
-        _pool[cfg.key()] = client
-        return client
+
+def _discard_client(pool_key: str, expected: paramiko.SSHClient | None = None) -> None:
+    client_to_close: paramiko.SSHClient | None = None
+    with _lock:
+        current = _pool.get(pool_key)
+        if expected is not None and current is not expected:
+            return
+        client_to_close = _pool.pop(pool_key, None)
+    if client_to_close:
+        try:
+            client_to_close.close()
+        except Exception:
+            pass
+
+
+def get_client(cfg: SSHConfig) -> paramiko.SSHClient:
+    pool_key = cfg.key()
+    with _lock:
+        existing = _pool.get(pool_key)
+
+    if existing and _is_alive(existing):
+        return existing
+    if existing:
+        _discard_client(pool_key, expected=existing)
+
+    client = _connect(cfg)
+    with _lock:
+        _pool[pool_key] = client
+    return client
 
 
 def close_client(cfg: SSHConfig) -> None:
-    with _lock:
-        client = _pool.pop(cfg.key(), None)
-        if client:
-            client.close()
+    _discard_client(cfg.key())
 
 
 def close_all() -> None:
@@ -140,41 +173,113 @@ def close_all() -> None:
 import time
 
 
+_RETRY_ERRNOS = {
+    32,   # EPIPE
+    54,   # ECONNRESET (macOS)
+    60,   # ETIMEDOUT (macOS)
+    104,  # ECONNRESET (Linux)
+    110,  # ETIMEDOUT (Linux)
+    111,  # ECONNREFUSED (Linux)
+}
+
+
+def _is_retryable_ssh_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            paramiko.SSHException,
+            EOFError,
+            socket.timeout,
+            TimeoutError,
+            ConnectionResetError,
+            BrokenPipeError,
+            ConnectionAbortedError,
+            ConnectionRefusedError,
+        ),
+    ):
+        return True
+
+    if isinstance(exc, OSError):
+        errno = getattr(exc, "errno", None)
+        if errno in _RETRY_ERRNOS:
+            return True
+        msg = str(exc).lower()
+        if "connection reset by peer" in msg or "broken pipe" in msg or "eof" in msg:
+            return True
+
+    return False
+
+
 def execute(cfg: SSHConfig, command: str) -> CommandResult:
-    client = get_client(cfg)
-    t0 = time.monotonic()
-    _, stdout_f, stderr_f = client.exec_command(
-        command, timeout=cfg.command_timeout
-    )
-    exit_code = stdout_f.channel.recv_exit_status()
-    stdout = stdout_f.read().decode("utf-8", errors="replace").strip()
-    stderr = stderr_f.read().decode("utf-8", errors="replace").strip()
-    duration = int((time.monotonic() - t0) * 1000)
-    return CommandResult(stdout=stdout, stderr=stderr,
-                         exit_code=exit_code, duration_ms=duration)
+    last_exc: BaseException | None = None
+    for attempt in (1, 2):
+        client = get_client(cfg)
+        t0 = time.monotonic()
+        try:
+            _, stdout_f, stderr_f = client.exec_command(
+                command, timeout=cfg.command_timeout
+            )
+            exit_code = stdout_f.channel.recv_exit_status()
+            stdout = stdout_f.read().decode("utf-8", errors="replace").strip()
+            stderr = stderr_f.read().decode("utf-8", errors="replace").strip()
+            duration = int((time.monotonic() - t0) * 1000)
+            return CommandResult(
+                stdout=stdout, stderr=stderr, exit_code=exit_code, duration_ms=duration
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 1 and _is_retryable_ssh_error(exc):
+                _discard_client(cfg.key(), expected=client)
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
+def _with_sftp_retry(cfg: SSHConfig, op):
+    last_exc: BaseException | None = None
+    for attempt in (1, 2):
+        client = get_client(cfg)
+        sftp = None
+        try:
+            sftp = client.open_sftp()
+            return op(sftp)
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 1 and _is_retryable_ssh_error(exc):
+                _discard_client(cfg.key(), expected=client)
+                continue
+            raise
+        finally:
+            if sftp is not None:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+    assert last_exc is not None
+    raise last_exc
 
 
 def read_file(cfg: SSHConfig, path: str) -> str:
-    sftp = get_client(cfg).open_sftp()
-    try:
+    def _op(sftp) -> str:
         with sftp.open(path, "r") as f:
             return f.read().decode("utf-8", errors="replace")
-    finally:
-        sftp.close()
+
+    return _with_sftp_retry(cfg, _op)
 
 
 def write_file(cfg: SSHConfig, path: str, content: str) -> None:
-    sftp = get_client(cfg).open_sftp()
-    try:
+    data = content.encode("utf-8")
+
+    def _op(sftp) -> None:
         with sftp.open(path, "w") as f:
-            f.write(content.encode("utf-8"))
-    finally:
-        sftp.close()
+            f.write(data)
+
+    _with_sftp_retry(cfg, _op)
 
 
 def list_directory(cfg: SSHConfig, path: str) -> list[dict]:
-    sftp = get_client(cfg).open_sftp()
-    try:
+    def _op(sftp) -> list[dict]:
         entries = []
         for attr in sftp.listdir_attr(path):
             is_dir = bool(attr.st_mode and (attr.st_mode & 0o40000))
@@ -187,8 +292,8 @@ def list_directory(cfg: SSHConfig, path: str) -> list[dict]:
             })
         entries.sort(key=lambda e: (not e["is_dir"], e["name"]))
         return entries
-    finally:
-        sftp.close()
+
+    return _with_sftp_retry(cfg, _op)
 
 
 def edit_file(
