@@ -21,6 +21,7 @@ DEFAULTS = {
     "username": os.getenv("SSH_DEFAULT_USER", ""),
     "private_key_path": os.getenv("SSH_KEY_PATH", ""),
     "password": os.getenv("SSH_DEFAULT_PASSWORD", ""),
+    "connect_timeout": int(os.getenv("SSH_CONNECT_TIMEOUT", "10")),
     "command_timeout": int(os.getenv("COMMAND_TIMEOUT", "30")),
 }
 
@@ -46,7 +47,8 @@ def _cfg(args: dict) -> SSHConfig:
         private_key_path=args.get("private_key_path") or DEFAULTS["private_key_path"] or None,
         passphrase=args.get("passphrase") or None,
         password=args.get("password") or DEFAULTS["password"] or None,
-        command_timeout=DEFAULTS["command_timeout"],
+        connect_timeout=int(args.get("connect_timeout") or DEFAULTS["connect_timeout"]),
+        command_timeout=int(args.get("command_timeout") or DEFAULTS["command_timeout"]),
     )
 
 
@@ -63,6 +65,12 @@ def _check_allowed(command: str) -> None:
 
 def _q(value: Any) -> str:
     return shlex.quote(str(value))
+
+def _normalize_command(command: Any) -> str:
+    cmd = str(command).strip()
+    if len(cmd) >= 2 and cmd[0] == cmd[-1] and cmd[0] in {"'", '"', "`"}:
+        return cmd[1:-1].strip()
+    return cmd
 
 
 def _exec(cfg: SSHConfig, command: str) -> CommandResult:
@@ -89,6 +97,8 @@ _CONN_PROPS = {
     "host": {"type": "string", "description": "SSH host (overrides SSH_DEFAULT_HOST)"},
     "port": {"type": "integer", "description": "SSH port, default 22"},
     "username": {"type": "string", "description": "SSH user (overrides SSH_DEFAULT_USER)"},
+    "connect_timeout": {"type": "integer", "description": "SSH connect timeout in seconds"},
+    "command_timeout": {"type": "integer", "description": "Remote command timeout in seconds"},
     "private_key_path": {
         "type": "string",
         "description": "Path to private key, e.g. ~/.ssh/id_ed25519 (overrides SSH_KEY_PATH)",
@@ -371,9 +381,10 @@ def dispatch(name: str, args: dict) -> str:
         return r.stdout or r.stderr
 
     elif name == "ssh_execute":
-        _check_allowed(args["command"])
+        command = _normalize_command(args["command"])
+        _check_allowed(command)
         cfg = _cfg(args)
-        r: CommandResult = ssh.execute(cfg, args["command"])
+        r: CommandResult = ssh.execute(cfg, command)
         return _json({
             "stdout": r.stdout,
             "stderr": r.stderr,

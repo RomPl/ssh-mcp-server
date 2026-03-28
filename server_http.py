@@ -390,12 +390,22 @@ async def messages_endpoint(request: Request, _=Depends(require_auth)):
     body = await request.json()
     queue = sessions[session_id]
 
-    async def process():
-        response = handle_jsonrpc(body)
+    async def process_in_background() -> None:
+        try:
+            # tools/call выполняет блокирующий SSH (paramiko).
+            # Важно не блокировать event loop: иначе ChatGPT получает TimeoutError на /messages.
+            response = await asyncio.to_thread(handle_jsonrpc, body)
+        except Exception as e:
+            req_id = body.get("id")
+            response = _ok(req_id, {
+                "content": [{"type": "text", "text": f"Error: {e}"}],
+                "isError": True,
+            })
+
         if response is not None:
             await queue.put(response)
 
-    await process()
+    asyncio.create_task(process_in_background())
     return Response(status_code=202)
 
 
