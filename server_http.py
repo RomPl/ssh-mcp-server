@@ -24,7 +24,7 @@ import sys
 import uuid
 import argparse
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -34,11 +34,16 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 import uvicorn
+from pydantic import BaseModel, Field
 
 from auth_oauth import (
     oauth,
     register_client,
     validate_client,
+    validate_chatgpt_client_secret,
+    validate_chatgpt_redirect_uri,
+    is_chatgpt_static_client_configured,
+    CHATGPT_CLIENT_ID,
     _sign_code,
     verify_code,
     create_access_token,
@@ -126,6 +131,156 @@ def handle_jsonrpc(msg: dict) -> dict | None:
     return _err(req_id, -32601, f"Method not found: {method}")
 
 
+
+
+class RestToolRequest(BaseModel):
+    arguments: dict = Field(default_factory=dict)
+
+
+class ShellRequest(BaseModel):
+    command: str
+    host: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    connect_timeout: Optional[int] = None
+    command_timeout: Optional[int] = None
+    private_key_path: Optional[str] = None
+    passphrase: Optional[str] = None
+    password: Optional[str] = None
+
+
+def _parse_tool_result(raw: str):
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def _dispatch_rest_tool(name: str, arguments: dict):
+    result = t.dispatch(name, arguments)
+    return {
+        "ok": True,
+        "tool": name,
+        "result": _parse_tool_result(result),
+    }
+
+
+
+# ── REST API bridge for GPT Actions ───────────────────────────────────────────
+
+def _custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "SSH MCP REST Bridge",
+            "description": (
+                "REST bridge over the existing SSH MCP tools for GPT Actions and other OpenAPI clients."
+            ),
+            "version": "1.0.0",
+        },
+        "servers": [{"url": PUBLIC_BASE_URL}],
+        "paths": {
+            "/health": {
+                "get": {
+                    "operationId": "getHealth",
+                    "description": "Health check",
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+            "/shell": {
+                "post": {
+                    "operationId": "runShellCommand",
+                    "description": "Execute a shell command on the remote Linux server via SSH.",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                        "host": {"type": "string"},
+                                        "port": {"type": "integer"},
+                                        "username": {"type": "string"},
+                                        "connect_timeout": {"type": "integer"},
+                                        "command_timeout": {"type": "integer"},
+                                        "private_key_path": {"type": "string"},
+                                        "passphrase": {"type": "string"},
+                                        "password": {"type": "string"},
+                                    },
+                                    "required": ["command"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "Command result"}},
+                }
+            },
+            "/tool/{name}": {
+                "post": {
+                    "operationId": "callTool",
+                    "description": (
+                        "Call any existing MCP SSH tool by name with the same arguments as the MCP tool schema."
+                    ),
+                    "parameters": [
+                        {
+                            "name": "name",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "requestBody": {
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "arguments": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                        }
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "Tool result"}},
+                }
+            },
+        },
+    }
+
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi
+
+
+@app.post("/shell")
+async def shell_endpoint(req: ShellRequest, user=Depends(require_auth)):
+    args = req.dict(exclude_none=True)
+    result = t.dispatch("ssh_execute", args)
+    parsed = _parse_tool_result(result)
+    if isinstance(parsed, dict):
+        return JSONResponse(parsed)
+    return JSONResponse({"ok": True, "stdout": str(parsed), "stderr": "", "code": 0})
+
+
+@app.post("/tool/{name}")
+@app.post("/tools/{name}")
+async def tool_bridge_endpoint(name: str, req: Optional[RestToolRequest] = None, user=Depends(require_auth)):
+    tool_names = {tool["name"] for tool in t.TOOLS}
+    if name not in tool_names:
+        raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
+    arguments = req.arguments if req else {}
+    return JSONResponse(_dispatch_rest_tool(name, arguments))
+
 # ── OAuth Discovery ───────────────────────────────────────────────────────────
 
 @app.get("/.well-known/oauth-protected-resource")
@@ -179,26 +334,54 @@ async def authorize(request: Request):
     Expects: client_id, redirect_uri, state, code_challenge, code_challenge_method
     Redirects to Google OAuth.
     """
+    response_type = request.query_params.get("response_type") or "code"
     client_id = request.query_params.get("client_id")
     redirect_uri = request.query_params.get("redirect_uri")
     state = request.query_params.get("state", "")
     code_challenge = request.query_params.get("code_challenge")
     code_challenge_method = request.query_params.get("code_challenge_method")
 
-    if not all([client_id, redirect_uri, code_challenge]):
-        raise HTTPException(status_code=400, detail="Missing required parameters")
+    is_static = bool(
+        is_chatgpt_static_client_configured() and client_id and client_id == CHATGPT_CLIENT_ID
+    )
+
+    missing = []
+    if not client_id:
+        missing.append("client_id")
+    if not redirect_uri:
+        missing.append("redirect_uri")
+    if not is_static:
+        if not code_challenge:
+            missing.append("code_challenge")
+        if not code_challenge_method:
+            missing.append("code_challenge_method")
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required parameters: {', '.join(missing)}",
+        )
+
+    if response_type != "code":
+        raise HTTPException(status_code=400, detail="Invalid response_type (expected 'code')")
 
     # Validate scope (must be mcp if provided)
-    scope = request.query_params.get("scope", "mcp")
+    scope = request.query_params.get("scope")
+    if not scope:
+        scope = "mcp"
     if scope != "mcp":
         raise HTTPException(status_code=400, detail="Invalid scope")
 
-    if code_challenge_method != "S256":
-        raise HTTPException(status_code=400, detail="Only S256 is supported")
+    if not is_static:
+        if code_challenge_method != "S256":
+            raise HTTPException(status_code=400, detail="Only S256 is supported")
 
-    # Do not validate client_id here: ChatGPT dynamic clients may be reused across
-    # server restarts, while in-memory registration is ephemeral.
-    # Access control is enforced by Google identity + ALLOWED_EMAIL + PKCE.
+    if is_chatgpt_static_client_configured() and client_id == CHATGPT_CLIENT_ID:
+        if not validate_client(client_id, redirect_uri):
+            raise HTTPException(status_code=400, detail="Invalid client_id or redirect_uri for static client")
+
+    # Note: for non-static clients we intentionally don't enforce in-memory registration
+    # here, because dynamic registration is ephemeral. Access control is enforced by
+    # Google identity + ALLOWED_EMAIL + PKCE.
     
 
     # Save OAuth request in session
@@ -206,8 +389,9 @@ async def authorize(request: Request):
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "code_challenge": code_challenge,
     }
+    if code_challenge:
+        request.session["oauth_req"]["code_challenge"] = code_challenge
 
     # Redirect to Google
     google_redirect_uri = f"{PUBLIC_BASE_URL}/google/callback"
@@ -242,11 +426,12 @@ async def google_callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     # Generate authorization code
+    code_challenge = oauth_req.get("code_challenge")
     code = _sign_code(
         email=email,
         client_id=oauth_req["client_id"],
-        code_challenge=oauth_req["code_challenge"],
         redirect_uri=oauth_req["redirect_uri"],
+        code_challenge=code_challenge,
     )
 
     # Redirect back to client
@@ -274,16 +459,28 @@ async def token_endpoint(
     code: str = Form(None),
     code_verifier: str = Form(None),
     client_id: str = Form(None),
+    client_secret: str = Form(None),
     redirect_uri: str = Form(None),
     refresh_token: str = Form(None),
 ):
     if grant_type == "authorization_code":
-        if not all([code, code_verifier, client_id, redirect_uri]):
-            raise HTTPException(status_code=400, detail="Missing required parameters")
+        missing = []
+        if not code:
+            missing.append("code")
+        if not client_id:
+            missing.append("client_id")
+        if not redirect_uri:
+            missing.append("redirect_uri")
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required parameters: {', '.join(missing)}",
+            )
 
-        email = verify_code(code, code_verifier, client_id, redirect_uri) \
-            if 'redirect_uri' in verify_code.__code__.co_varnames \
-            else verify_code(code, code_verifier, client_id)
+        validate_chatgpt_redirect_uri(client_id, redirect_uri)
+        validate_chatgpt_client_secret(client_id, client_secret)
+
+        email = verify_code(code, code_verifier, client_id, redirect_uri)
 
         access_token = create_access_token(email)
 

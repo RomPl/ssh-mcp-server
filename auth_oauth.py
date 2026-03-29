@@ -32,6 +32,10 @@ ALLOWED_EMAIL = os.getenv("ALLOWED_EMAIL", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 OAUTH_CODE_SECRET = os.getenv("OAUTH_CODE_SECRET", "")
 
+CHATGPT_CLIENT_ID = os.getenv("CHATGPT_CLIENT_ID", "")
+CHATGPT_CLIENT_SECRET = os.getenv("CHATGPT_CLIENT_SECRET", "")
+CHATGPT_REDIRECT_URI = os.getenv("CHATGPT_REDIRECT_URI", "")
+
 _missing = []
 if not PUBLIC_BASE_URL:
     _missing.append("PUBLIC_BASE_URL")
@@ -86,6 +90,14 @@ def register_client(redirect_uris: list[str]) -> dict:
 
 def validate_client(client_id: str, redirect_uri: str) -> bool:
     """Validate client_id and redirect_uri."""
+    if (
+        CHATGPT_CLIENT_ID
+        and CHATGPT_CLIENT_SECRET
+        and CHATGPT_REDIRECT_URI
+        and client_id == CHATGPT_CLIENT_ID
+    ):
+        return redirect_uri == CHATGPT_REDIRECT_URI
+
     client = _clients.get(client_id)
     if not client:
         return False
@@ -94,15 +106,21 @@ def validate_client(client_id: str, redirect_uri: str) -> bool:
 
 # ── Authorization code (HMAC-signed, stateless) ──────────────────────────────
 
-def _sign_code(email: str, client_id: str, code_challenge: str, redirect_uri: str) -> str:
+def _sign_code(
+    email: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: Optional[str] = None,
+) -> str:
     """Create HMAC-signed authorization code."""
     payload = {
         "email": email,
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "code_challenge": code_challenge,
         "iat": int(time.time()),
     }
+    if code_challenge:
+        payload["code_challenge"] = code_challenge
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     sig = hmac.new(OAUTH_CODE_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()[:32]
     # code = base64url(payload) + "." + signature
@@ -111,7 +129,12 @@ def _sign_code(email: str, client_id: str, code_challenge: str, redirect_uri: st
     return f"{encoded}.{sig}"
 
 
-def verify_code(code: str, code_verifier: str, client_id: str, redirect_uri: str | None = None) -> str:
+def verify_code(
+    code: str,
+    code_verifier: Optional[str],
+    client_id: str,
+    redirect_uri: Optional[str] = None,
+) -> str:
     """
     Verify authorization code + PKCE.
     Returns email if valid, raises HTTPException otherwise.
@@ -152,18 +175,54 @@ def verify_code(code: str, code_verifier: str, client_id: str, redirect_uri: str
             if payload.get("redirect_uri") != redirect_uri:
                 raise ValueError("redirect_uri mismatch")
 
-        # Verify PKCE S256
-        challenge = payload["code_challenge"]
-        digest = hashlib.sha256(code_verifier.encode()).digest()
-        import base64 as b64
-        computed = b64.urlsafe_b64encode(digest).decode().rstrip("=")
-        if not hmac.compare_digest(computed, challenge):
-            raise ValueError("PKCE verification failed")
+        challenge = payload.get("code_challenge")
+        if challenge:
+            if not code_verifier:
+                raise ValueError("Missing code_verifier")
+            digest = hashlib.sha256(code_verifier.encode()).digest()
+            import base64 as b64
+            computed = b64.urlsafe_b64encode(digest).decode().rstrip("=")
+            if not hmac.compare_digest(computed, challenge):
+                raise ValueError("PKCE verification failed")
+        else:
+            # Allow no-PKCE only for configured static ChatGPT client.
+            if not is_chatgpt_static_client(payload["client_id"]):
+                raise ValueError("PKCE is required for this client")
 
         return payload["email"]
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid code: {e}")
+
+
+def is_chatgpt_static_client_configured() -> bool:
+    return bool(CHATGPT_CLIENT_ID and CHATGPT_CLIENT_SECRET and CHATGPT_REDIRECT_URI)
+
+
+def is_chatgpt_static_client(client_id: str) -> bool:
+    return is_chatgpt_static_client_configured() and client_id == CHATGPT_CLIENT_ID
+
+
+def validate_chatgpt_redirect_uri(client_id: str, redirect_uri: str) -> None:
+    if not is_chatgpt_static_client(client_id):
+        return
+    if redirect_uri != CHATGPT_REDIRECT_URI:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid redirect_uri for static client. "
+                "Expected CHATGPT_REDIRECT_URI exactly."
+            ),
+        )
+
+
+def validate_chatgpt_client_secret(client_id: str, client_secret: Optional[str]) -> None:
+    if not is_chatgpt_static_client(client_id):
+        return
+    if not client_secret:
+        raise HTTPException(status_code=401, detail="Missing client_secret for static client")
+    if not hmac.compare_digest(client_secret, CHATGPT_CLIENT_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid client_secret for static client")
 
 
 # ── JWT access token ─────────────────────────────────────────────────────────

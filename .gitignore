@@ -48,3 +48,4 @@ public_html/
 # Backup files
 *.bak
 *.backup
+*.bak_*
